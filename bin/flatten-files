@@ -1,0 +1,203 @@
+#!/bin/bash
+# flatten-files: preview-first directory flattener for macOS (Bash 3.2+)
+set -euo pipefail
+
+usage() {
+  cat <<'HELP'
+Usage:
+  flatten-files                        Preview flattening the current directory
+  flatten-files --apply                Move nested files into the current directory
+  flatten-files clean                  Preview removing empty subdirectories
+  flatten-files clean --apply          Remove empty subdirectories
+  flatten-files --apply --clean-empty  Flatten, then remove empty subdirectories
+  flatten-files --help                 Show this help
+
+Defaults and safeguards:
+  * No files or folders are changed without --apply.
+  * Existing filenames are preserved; collisions get " (1)", " (2)", etc.
+  * Hidden directories (such as .git and .venv) are skipped.
+  * Symlinks are not followed or moved; mounted filesystems are not traversed.
+  * Empty-folder removal uses rmdir, never recursive deletion.
+  * Refuses changes directly in / or your home directory.
+HELP
+}
+
+operation=flatten
+apply=0
+clean_after=0
+operation_seen=0
+
+for arg in "$@"; do
+  case "$arg" in
+    flatten|clean)
+      if [[ "$operation_seen" -eq 1 ]]; then
+        printf 'Error: specify only one operation.\n' >&2
+        exit 2
+      fi
+      operation="$arg"
+      operation_seen=1
+      ;;
+    --apply) apply=1 ;;
+    --dry-run) apply=0 ;;
+    --clean-empty) clean_after=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'Unknown option: %s\n' "$arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ "$operation" == clean && "$clean_after" -eq 1 ]]; then
+  printf 'Error: --clean-empty is only valid when flattening. Use "clean --apply".\n' >&2
+  exit 2
+fi
+
+cwd=$(pwd -P)
+home=$(cd "$HOME" && pwd -P)
+if [[ "$apply" -eq 1 && ( "$cwd" == / || "$cwd" == "$home" ) ]]; then
+  printf 'Refusing changes directly in / or your home directory: %s\n' "$cwd" >&2
+  exit 1
+fi
+
+# Build a stable, NUL-separated list before any modifications. If TMPDIR happens
+# to be inside the current directory, use /tmp instead to avoid scanning our list.
+temp_parent="${TMPDIR:-/tmp}"
+temp_parent_real=$(cd "$temp_parent" && pwd -P)
+if [[ "$temp_parent_real" == "$cwd"/* ]]; then
+  temp_parent=/tmp
+fi
+manifest=$(mktemp "$temp_parent/flatten-files.XXXXXXXX")
+trap 'rm -f "$manifest"' EXIT
+
+# On macOS, find -xdev avoids traversing other mounted filesystems.
+# -prune excludes hidden directory trees, including .git, without excluding
+# dotfiles in visible directories.
+scan_files() {
+  find . -xdev \
+    \( -type d -name '.*' ! -path . -prune \) -o \
+    \( -type f -print0 \)
+}
+
+scan_empty_dirs() {
+  find . -xdev \
+    \( -type d -name '.*' ! -path . -prune \) -o \
+    \( -type d -empty ! -path . -print0 \)
+}
+
+clean_empty_dirs() {
+  local directory removed_pass removed_total
+  removed_total=0
+
+  if [[ "$apply" -eq 0 ]]; then
+    scan_empty_dirs > "$manifest"
+    if [[ ! -s "$manifest" ]]; then
+      printf 'No currently empty subdirectories found.\n'
+    else
+      while IFS= read -r -d '' directory; do
+        printf 'Would remove empty directory: %q\n' "$directory"
+      done < "$manifest"
+      printf 'Note: parent directories that later become empty may also be removed.\n'
+    fi
+    return 0
+  fi
+
+  # Remove leaf directories first. Iterate so newly-empty parents are removed.
+  while :; do
+    scan_empty_dirs > "$manifest"
+    [[ -s "$manifest" ]] || break
+    removed_pass=0
+
+    while IFS= read -r -d '' directory; do
+      if rmdir "$directory" 2>/dev/null; then
+        printf 'Removed empty directory: %q\n' "$directory"
+        removed_pass=$((removed_pass + 1))
+        removed_total=$((removed_total + 1))
+      else
+        printf 'Could not remove directory (changed or permission denied): %q\n' "$directory" >&2
+      fi
+    done < "$manifest"
+
+    if [[ "$removed_pass" -eq 0 ]]; then
+      printf 'Cleanup stopped: some empty directories could not be removed.\n' >&2
+      return 1
+    fi
+  done
+
+  printf 'Removed %s empty directorie(s).\n' "$removed_total"
+}
+
+if [[ "$operation" == clean ]]; then
+  clean_empty_dirs
+  exit $?
+fi
+
+scan_files > "$manifest"
+found=0
+moved=0
+failed=0
+
+while IFS= read -r -d '' source; do
+  # Keep -prune effective on immediate hidden children (find -mindepth is global).
+  [[ "$source" == ./*/* ]] || continue
+  found=$((found + 1))
+
+  if [[ "$apply" -eq 0 ]]; then
+    printf 'Would move: %q\n' "$source"
+    continue
+  fi
+
+  if [[ ! -f "$source" || -L "$source" ]]; then
+    printf 'Skipped missing/changed source: %q\n' "$source" >&2
+    failed=$((failed + 1))
+    continue
+  fi
+
+  base="${source##*/}"
+  stem="$base"
+  extension=""
+  case "$base" in
+    .*.*|?*.*)
+      stem="${base%.*}"
+      extension=".${base##*.}"
+      ;;
+  esac
+
+  destination="./$base"
+  suffix=1
+  while [[ -e "$destination" || -L "$destination" ]]; do
+    destination="./${stem} (${suffix})${extension}"
+    suffix=$((suffix + 1))
+  done
+
+  # macOS 'mv -n' refuses to overwrite if a destination appears concurrently.
+  # A successful exit can also mean "skipped", so confirm source was removed.
+  if mv -n "$source" "$destination"; then
+    if [[ -e "$source" || -L "$source" ]]; then
+      printf 'Not moved (destination may have appeared): %q\n' "$source" >&2
+      failed=$((failed + 1))
+    else
+      printf 'Moved: %q -> %q\n' "$source" "$destination"
+      moved=$((moved + 1))
+    fi
+  else
+    printf 'Move failed: %q\n' "$source" >&2
+    failed=$((failed + 1))
+  fi
+done < "$manifest"
+
+if [[ "$apply" -eq 0 ]]; then
+  printf 'Dry run: %s nested file(s) found. Use --apply to move them.\n' "$found"
+  if [[ "$clean_after" -eq 1 ]]; then
+    printf '\nCurrently empty directories (before flattening):\n'
+    clean_empty_dirs
+  fi
+  exit 0
+fi
+
+printf 'Finished: %s moved, %s failed.\n' "$moved" "$failed"
+if [[ "$failed" -gt 0 ]]; then
+  printf 'Cleanup skipped because some moves failed.\n' >&2
+  exit 1
+fi
+
+if [[ "$clean_after" -eq 1 ]]; then
+  clean_empty_dirs
+fi
